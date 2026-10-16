@@ -1,0 +1,197 @@
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray
+import os
+import select
+import termios
+import threading
+import time
+import tty
+
+# Terminals report key presses but not releases. Holding a key auto-repeats
+# (after an initial delay of ~0.5s), so a direction key counts as "released"
+# once no key has arrived for this long.
+KEY_TIMEOUT = 0.6
+
+KEY_COMMANDS = {
+    'w': (0.3, 0.3),
+    's': (-0.3, -0.3),
+    'a': (-0.5, 0.5),
+    'd': (0.5, -0.5),
+    'x': (0.0, 0.0),
+    ' ': (0.0, 0.0),
+}
+
+
+class KeyboardControllerNode(Node):
+    def __init__(self):
+        super().__init__('keyboard_controller_node')
+
+        # create publisher for motor commands
+        self.publisher = self.create_publisher(
+            Float32MultiArray,
+            'motor_commands',
+            10
+        )
+
+        # keyboard state
+        self.current_L = 0.0
+        self.current_R = 0.0
+        self.last_key_time = 0.0
+        self.running = True
+        self.tty_file = None
+        self.old_term = None
+
+        # start keyboard listener
+        self.start_keyboard_listener()
+
+        # setup timer to publish commands at 20Hz
+        self.timer = self.create_timer(0.05, self.publish_motor_commands)  # 20Hz
+
+        self.get_logger().info('Keyboard Controller Node started')
+        self.print_instructions()
+
+    def print_instructions(self):
+        """print control instructions"""
+        instructions = """
+========================================
+   🚗  Robot Keyboard Controller
+----------------------------------------
+   W : Forward  (L=0.3, R=0.3)
+   S : Backward (L=-0.3, R=-0.3)
+   A : Turn Left (L=-0.5, R=0.5)
+   D : Turn Right (L=0.5, R=-0.5)
+   X / Space : Stop (L=0.0, R=0.0)
+  ESC / Q: Quit
+  Hold a key to keep moving; release to stop.
+========================================
+Publishing motor commands on topic: motor_commands
+"""
+        self.get_logger().info(instructions)
+
+    def on_key(self, c):
+        """key press callback"""
+        if c in KEY_COMMANDS:
+            self.current_L, self.current_R = KEY_COMMANDS[c]
+            self.last_key_time = time.monotonic()
+
+    def start_keyboard_listener(self):
+        """Read keys from the terminal in a separate thread"""
+        # Open /dev/tty directly so this works over SSH (no X display needed)
+        # and under `ros2 launch`, which does not forward stdin to nodes.
+        try:
+            self.tty_file = open('/dev/tty', 'rb', buffering=0)
+        except OSError as e:
+            self.get_logger().error(
+                f'Cannot open terminal for keyboard input ({e}). '
+                'Run this node from an interactive terminal.')
+            raise
+        fd = self.tty_file.fileno()
+        self.old_term = termios.tcgetattr(fd)
+        # cbreak: keys arrive immediately without echo; Ctrl-C still works
+        tty.setcbreak(fd)
+
+        def listener_thread():
+            try:
+                while self.running:
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if not ready:
+                        continue
+                    data = os.read(fd, 32).decode(errors='ignore')
+                    if data == '\x1b' or data.lower() == 'q':
+                        self.get_logger().info('Quit key pressed, shutting down...')
+                        self.running = False
+                        self.restore_terminal()
+                        rclpy.shutdown()
+                        return
+                    # ignore escape sequences (arrow keys etc.)
+                    if data.startswith('\x1b'):
+                        continue
+                    for c in data:
+                        self.on_key(c.lower())
+            except Exception as e:
+                if self.running:
+                    self.get_logger().error(f'Error reading keyboard: {str(e)}')
+            finally:
+                self.restore_terminal()
+
+        self.listener_thread = threading.Thread(target=listener_thread, daemon=True)
+        self.listener_thread.start()
+        self.get_logger().info('Keyboard listener started')
+
+    def restore_terminal(self):
+        """Put the terminal back the way we found it"""
+        if self.tty_file is not None and self.old_term is not None:
+            try:
+                termios.tcsetattr(self.tty_file.fileno(), termios.TCSADRAIN, self.old_term)
+            except Exception:
+                pass
+            self.old_term = None
+
+    def publish_motor_commands(self):
+        """Publish motor commands to ROS topic"""
+        if self.running and rclpy.ok():
+            try:
+                # stop once the key has been released
+                if time.monotonic() - self.last_key_time > KEY_TIMEOUT:
+                    self.current_L = 0.0
+                    self.current_R = 0.0
+
+                msg = Float32MultiArray()
+                msg.data = [self.current_L, self.current_R]
+                self.publisher.publish(msg)
+
+                # Log only when commands change to reduce console spam
+                if hasattr(self, '_last_L') and hasattr(self, '_last_R'):
+                    if self._last_L != self.current_L or self._last_R != self.current_R:
+                        self.get_logger().info(f'Motor command: L={self.current_L:.2f}, R={self.current_R:.2f}')
+                else:
+                    self.get_logger().info(f'Motor command: L={self.current_L:.2f}, R={self.current_R:.2f}')
+
+                self._last_L = self.current_L
+                self._last_R = self.current_R
+            except Exception as e:
+                # Context may be shutting down, ignore errors
+                if self.running:
+                    self.get_logger().error(f'Error publishing command: {str(e)}')
+
+    def destroy_node(self):
+        """Cleanup operations when node is destroyed"""
+        self.running = False
+        self.restore_terminal()
+
+        # Send stop command before shutdown
+        msg = Float32MultiArray()
+        msg.data = [0.0, 0.0]
+        self.publisher.publish(msg)
+        self.get_logger().info('Stop command sent')
+
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = KeyboardControllerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # If timer already destroyed the node, skip
+        if not getattr(node, "_already_destroyed", False):
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+        return 0  # <-- ensure exit code 0
+
+
+
+if __name__ == '__main__':
+    main()

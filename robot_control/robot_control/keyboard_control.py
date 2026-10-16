@@ -1,8 +1,13 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
-from pynput.keyboard import Key, Listener
 import threading
+import atexit, os, select, termios, tty
+from types import SimpleNamespace
+
+
+class Key:  # stand-in for pynput.keyboard.Key (pynput needs an X display)
+    esc = 'esc'
 
 
 class KeyboardControllerNode(Node):
@@ -41,6 +46,8 @@ class KeyboardControllerNode(Node):
    S : Backward (L=-0.3, R=-0.3)
    A : Turn Left (L=-0.5, R=0.5)
    D : Turn Right (L=0.5, R=-0.5)
+   Q : Curve Left  (L=0.0, R=0.3)
+   E : Curve Right (L=0.3, R=0.0)
    X : Stop (L=0.0, R=0.0)
   ESC: Quit
 ========================================
@@ -57,16 +64,22 @@ Publishing motor commands on topic: motor_commands
                 
                 if c == 'w':
                     self.current_L = 0.3
-                    self.current_R = 0.3
+                    self.current_R = 0.25
                 elif c == 's':
                     self.current_L = -0.3
-                    self.current_R = -0.3
+                    self.current_R = -0.25
                 elif c == 'a':
-                    self.current_L = -0.5
-                    self.current_R = 0.5
+                    self.current_L = -0.3
+                    self.current_R = 0.3
                 elif c == 'd':
-                    self.current_L = 0.5
-                    self.current_R = -0.5
+                    self.current_L = 0.3
+                    self.current_R = -0.3
+                elif c == 'q':
+                    self.current_L = 0.0
+                    self.current_R = 0.3
+                elif c == 'e':
+                    self.current_L = 0.3
+                    self.current_R = 0.0
                 elif c == 'x':
                     self.current_L = 0.0
                     self.current_R = 0.0
@@ -89,7 +102,7 @@ Publishing motor commands on topic: motor_commands
                 self.pressed_keys.discard(c)
                 
                 # stop if no direction keys are pressed
-                if not any(k in self.pressed_keys for k in 'wasd'):
+                if not any(k in self.pressed_keys for k in 'wasdqe'):
                     self.current_L = 0.0
                     self.current_R = 0.0
                     self.get_logger().debug('All direction keys released, stopping')
@@ -100,8 +113,23 @@ Publishing motor commands on topic: motor_commands
     def start_keyboard_listener(self):
         """Start keyboard listener in a separate thread"""
         def listener_thread():
-            with Listener(on_press=self.on_press, on_release=self.on_release, suppress=True) as listener:
-                listener.join()
+            # read keys from the terminal (works over SSH and under ros2 launch)
+            fd = os.open('/dev/tty', os.O_RDONLY)
+            old = termios.tcgetattr(fd)
+            atexit.register(termios.tcsetattr, fd, termios.TCSADRAIN, old)
+            tty.setcbreak(fd)
+            while self.running:
+                # terminals don't report key releases: 0.6s with no key = released
+                if select.select([fd], [], [], 0.6)[0]:
+                    c = os.read(fd, 1).decode(errors='ignore')
+                    if c == '\x1b':
+                        self.on_release(Key.esc)
+                        break
+                    self.on_press(SimpleNamespace(char=c))
+                else:
+                    for c in list(self.pressed_keys):
+                        self.on_release(SimpleNamespace(char=c))
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
         
         self.listener_thread = threading.Thread(target=listener_thread, daemon=True)
         self.listener_thread.start()
