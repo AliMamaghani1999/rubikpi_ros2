@@ -30,6 +30,7 @@ setup(
             'motor_control = robot_control.motor_control:main',
             'keyboard_control = robot_control.keyboard_control:main',
             'waypoint_control = robot_control.waypoint_control:main',
+            'closed_loop_control = robot_control.closed_loop_control:main',
             'velocity_control = robot_control.velocity_control:main',
         ],
     },
