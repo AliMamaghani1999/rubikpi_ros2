@@ -31,6 +31,7 @@ setup(
             'keyboard_control = robot_control.keyboard_control:main',
             'waypoint_control = robot_control.waypoint_control:main',
             'closed_loop_control = robot_control.closed_loop_control:main',
+            'slam_control = robot_control.slam_control:main',
             'velocity_control = robot_control.velocity_control:main',
         ],
     },

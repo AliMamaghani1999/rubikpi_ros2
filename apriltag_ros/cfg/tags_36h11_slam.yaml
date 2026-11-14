@@ -1,0 +1,19 @@
+/**:
+    ros__parameters:
+        image_transport: raw    # image format
+        family: 36h11           # tag family name
+        size: 0.074             # tag edge size in meter
+        max_hamming: 1          # maximum allowed hamming distance (corrected bits)
+
+        # see "apriltag.h" 'struct apriltag_detector' for more documentation on these optional parameters
+        detector:
+            threads: 4          # number of threads
+            decimate: 1.0       # full resolution: 2.0 misses tag 3 at 2.3 m
+            blur: 0.0           # sigma of Gaussian blur for quad detection
+            refine: True        # snap to strong gradients
+            sharpening: 0.4     # sharpening of decoded images
+            debug: False        # write additional debugging images to current working directory
+
+
+        pose_estimation_method: "pnp"   # method for estimating the tag pose
+        # no tag list: report every 36h11 tag, so SLAM does not know how many landmarks there are
